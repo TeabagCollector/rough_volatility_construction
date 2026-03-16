@@ -6,69 +6,11 @@ RFSV 波动率预测模块
 
 import numpy as np
 import pandas as pd
-from typing import Optional, Tuple, Union
-from scipy import stats
+from typing import Dict, Optional, Tuple, Union
+from scipy.integrate import quad
 from scipy.special import gamma
 import warnings
 warnings.filterwarnings('ignore')
-
-
-def estimate_nu_sq(log_var_series: Union[pd.Series, np.ndarray],
-                   delta_max: int = 30) -> Tuple[float, dict]:
-    """
-    从 log m(2, Δ) 对 log Δ 的回归中估计 ν² (vol-of-vol 的平方)
-    
-    与 Hurst 估计一致，m(2, Δ) 定义在 log σ 上（Gatheral Section 2.1）。
-    输入 log σ² 时内部转为 log σ = 0.5 * log σ²。
-    理论关系：log m(2, Δ) ≈ 2H·log Δ + log(ν²)，截距的指数即为 ν²。
-    
-    Args:
-        log_var_series: log σ² 序列（即 np.log(rv_uz)）
-        delta_max: 最大滞后期，默认 30
-    
-    Returns:
-        (nu_sq, info_dict): ν² 和回归信息
-    """
-    # m(2, Δ) 定义在 log σ 上（与 Hurst 估计一致），log σ = 0.5 * log σ²
-    if isinstance(log_var_series, pd.Series):
-        arr = (0.5 * log_var_series).values
-    else:
-        arr = 0.5 * np.asarray(log_var_series)
-    
-    if len(arr) < delta_max + 10:
-        return np.nan, {'error': 'insufficient data'}
-    
-    log_deltas = []
-    log_m2s = []
-    
-    for delta in range(1, delta_max + 1):
-        # delta 步长增量：arr[t+Δ]-arr[t]，非 np.diff(., n=Δ) 的 Δ 阶差分
-        incr = arr[delta:] - arr[:-delta]
-        if len(incr) < 5:
-            continue
-        m2 = np.mean(incr ** 2)
-        if m2 <= 0:
-            continue
-        log_m2s.append(np.log(m2))
-        log_deltas.append(np.log(delta))
-    
-    if len(log_deltas) < 3:
-        return np.nan, {'error': 'insufficient valid deltas'}
-    
-    slope, intercept, r_value, p_value, std_err = stats.linregress(
-        log_deltas, log_m2s
-    )
-    nu_sq = np.exp(intercept)
-    
-    info = {
-        'slope': slope,
-        'intercept': intercept,
-        'r_squared': r_value ** 2,
-        'nu_sq': nu_sq,
-        'n_deltas': len(log_deltas),
-    }
-    return nu_sq, info
-
 
 class RFSVPredictor:
     """
@@ -82,32 +24,60 @@ class RFSVPredictor:
                  H: float,
                  nu_sq: float,
                  delta: int = 1,
-                 window_ratio: float = 1.0):
+                 window_ratio: float = 1.0,
+                 weight_mode: str = "hybrid",
+                 exact_lag_cutoff: int = 8,
+                 use_second_order_tail: bool = False,
+                 second_order_start: int = 12):
         """
         Args:
             H: Hurst 指数
             nu_sq: ν²，从 m(2,Δ) 回归截距得到
             delta: 预测 horizon（天数）
             window_ratio: r，积分窗口 [t - r*Δ, t]
+            weight_mode: 权重计算模式，可选 "approx"/"hybrid"/"exact"
+            exact_lag_cutoff: hybrid 模式下用精确积分的最大滞后 i
+            use_second_order_tail: 是否在大滞后区间启用二阶尾部修正
+            second_order_start: 二阶尾部修正启用的最小滞后 i
         """
         self.H = H
         self.nu_sq = nu_sq
         self.delta = delta
         self.window_ratio = window_ratio
+        self.weight_mode = str(weight_mode).lower().strip()
+        self.exact_lag_cutoff = int(exact_lag_cutoff)
+        self.use_second_order_tail = bool(use_second_order_tail)
+        self.second_order_start = int(second_order_start)
         
         # 修正系数 c = Γ(3/2-H) / (Γ(H+1/2) * Γ(2-2H))，用于方差预测
         self._c = gamma(1.5 - H) / (gamma(H + 0.5) * gamma(2 - 2 * H))
+        self._weight_cache: Dict[Tuple[float, int, float, int, str, int, bool, int], np.ndarray] = {}
+        self._validate_config()
 
-    def _compute_interval_weight(self, i: int) -> float:
+    def _validate_config(self) -> None:
+        if not (0.0 < self.H < 0.5):
+            raise ValueError("H 必须在 (0, 0.5) 区间内。")
+        if self.delta <= 0:
+            raise ValueError("delta 必须为正整数。")
+        if self.window_ratio <= 0:
+            raise ValueError("window_ratio 必须为正数。")
+        if self.weight_mode not in {"approx", "hybrid", "exact"}:
+            raise ValueError("weight_mode 必须是 'approx'、'hybrid' 或 'exact'。")
+        if self.exact_lag_cutoff < 0:
+            raise ValueError("exact_lag_cutoff 不能为负数。")
+        if self.second_order_start < 0:
+            raise ValueError("second_order_start 不能为负数。")
+
+    def _compute_interval_weight_approx(self, i: int) -> float:
         """
         计算回溯步长 i 对应的区间积分权重 W_i。
 
-        区间 u ∈ [i-0.5, i+0.5]，核函数 1/((u+Δ)u^{H-1/2})。
-        近似：W_i ≈ ((i+0.5)^{1.5-H} - u_lo^{1.5-H}) / ((i+Δ)(1.5-H))
+        区间 u ∈ [i-0.5, i+0.5]，核函数 1/((u+Δ)u^{H+1/2})。
+        近似：W_i ≈ ((i+0.5)^{0.5-H} - u_lo^{0.5-H}) / ((i+Δ)(0.5-H))
         - i=0（今天）：u ∈ [0, 0.5]，u_lo=0，积分收敛
         - i≥1：u_lo = max(0, i-0.5)，避免原点奇异性
         """
-        exp_val = 1.5 - self.H
+        exp_val = 0.5 - self.H
         if exp_val <= 0:
             return 0.0
         u_lo = max(0.0, i - 0.5)
@@ -117,6 +87,70 @@ class RFSVPredictor:
         integral_val = (term_hi - term_lo) / exp_val
         return integral_val / (i + self.delta)
 
+    def _compute_interval_weight_exact(self, i: int) -> float:
+        """
+        数值积分计算精确区间权重：
+        W_i = ∫_{u_lo}^{u_hi} 1 / ((u+Δ)u^{H+1/2}) du
+        """
+        u_lo = max(0.0, i - 0.5)
+        u_hi = i + 0.5
+
+        def integrand(u: float) -> float:
+            return 1.0 / ((u + self.delta) * (u ** (self.H + 0.5)))
+
+        points = [0.0] if i == 0 else None
+        val, _ = quad(integrand, u_lo, u_hi, points=points, limit=200)
+        return float(val)
+
+    def _compute_second_order_tail_correction(self, i: int) -> float:
+        """
+        大滞后尾部二阶修正（针对 1/(u+Δ) 的二阶展开近似）。
+        该修正在 i 足够大时有效。
+        """
+        if i <= 0:
+            return 0.0
+        a = self.H + 0.5
+        # 对称区间 [i-0.5, i+0.5] 上近似：∫(u-i)^2 u^{-a} du ≈ i^{-a} / 12
+        return (i ** (-a)) / (12.0 * ((i + self.delta) ** 3))
+
+    def _compute_interval_weight(self, i: int) -> float:
+        if self.weight_mode == "exact":
+            return self._compute_interval_weight_exact(i)
+
+        if self.weight_mode == "approx":
+            w = self._compute_interval_weight_approx(i)
+            if self.use_second_order_tail and i >= self.second_order_start:
+                w += self._compute_second_order_tail_correction(i)
+            return w
+
+        # hybrid: 小滞后精确，大滞后快速近似
+        if i <= self.exact_lag_cutoff:
+            return self._compute_interval_weight_exact(i)
+
+        w = self._compute_interval_weight_approx(i)
+        if self.use_second_order_tail and i >= self.second_order_start:
+            w += self._compute_second_order_tail_correction(i)
+        return w
+
+    def _get_weight_vector(self, n: int) -> np.ndarray:
+        """
+        获取长度为 n 的权重向量（含缓存），用于加速滚动预测。
+        """
+        key = (
+            round(float(self.H), 12),
+            int(self.delta),
+            round(float(self.window_ratio), 8),
+            int(n),
+            self.weight_mode,
+            int(self.exact_lag_cutoff),
+            bool(self.use_second_order_tail),
+            int(self.second_order_start),
+        )
+        if key not in self._weight_cache:
+            w = np.array([self._compute_interval_weight(i) for i in range(n)], dtype=float)
+            self._weight_cache[key] = w
+        return self._weight_cache[key]
+
     def predict_log_variance(self,
                              log_var_series: Union[pd.Series, np.ndarray],
                              t: int) -> float:
@@ -125,7 +159,7 @@ class RFSVPredictor:
 
         基于「观测值势力范围」的区间积分形式（公式 5.1 离散化）：
         - 回溯步长 i ∈ {0, 1, ..., n-1}，i=0 为今天，对应 u ∈ [i-0.5, i+0.5]
-        - 核函数 1/((u+Δ)u^{H-1/2}) 在区间内积分得权重 W_i
+        - 核函数 1/((u+Δ)u^{H+1/2}) 在区间内积分得权重 W_i
         - window_ratio=1 且 delta=1 时，n_max=1，仅用今天（1 日）数据
         - 在 logσ 空间加权（输入 0.5*logσ²），归一化后还原为 logσ²
         """
@@ -140,24 +174,16 @@ class RFSVPredictor:
         if n < 1:
             return np.nan
         
-        weights = []
-        log_sigma_vals = []
-        for i in range(0, n):
-            idx = t - i
-            if idx < 0:
-                break
-            w = self._compute_interval_weight(i)
-            if w <= 0:
-                continue
-            weights.append(w)
-            log_sigma_vals.append(0.5 * log_var_arr[idx])
-        
-        if not weights:
+        # 先取缓存权重，再对有效正权重做筛选
+        all_weights = self._get_weight_vector(n)
+        valid_mask = all_weights > 0
+        if not np.any(valid_mask):
             return np.nan
-        
-        weights = np.array(weights)
-        log_sigma_vals = np.array(log_sigma_vals)
-        w_sum = np.sum(weights)
+
+        weights = all_weights[valid_mask]
+        i_idx = np.arange(n)[valid_mask]
+        log_sigma_vals = 0.5 * log_var_arr[t - i_idx]
+        w_sum = float(np.sum(weights))
         if w_sum <= 0:
             return np.nan
         

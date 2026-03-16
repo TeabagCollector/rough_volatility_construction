@@ -1,0 +1,26 @@
+S&P 500 数据需求整理
+
+一、数据 
+
+时间：2020-2025年
+
+1) 指数相关 - 分钟级和日度级
+- 分钟级别价格变动
+- 日度级别：open, close, high, low
+
+2) 期权相关 - 日度
+- option_id
+- option_type（call/put）
+- strike
+- maturity_date
+- tau（年化剩余期限）
+- iv
+- close
+
+3) 利率
+- 日度十年期国债利率（用作无风险利率）
+
+
+
+
+
